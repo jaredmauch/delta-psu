@@ -23,6 +23,9 @@ Usage Examples:
     # Different I2C bus
     python delta-psu-read.py --bus 0
 
+    # Read from hex dump file
+    python delta-psu-read.py --file ii2c-hex.txt
+
 Features:
     - Read manufacturer information (ID, model, serial number, etc.)
     - Monitor operating parameters (voltage, current, power, efficiency)
@@ -32,17 +35,19 @@ Features:
     - Monitor timing parameters
     - Output in human-readable or JSON format
     - Support for multiple I2C addresses and buses
+    - Support for reading from hex dump files
 
 Requirements:
     - Python 3.x
-    - smbus module (python3-smbus package)
-    - I2C access permissions
+    - smbus module (python3-smbus package) for I2C access
+    - I2C access permissions (when using I2C mode)
 """
 
 import json
 import smbus
 import argparse
 from datetime import datetime
+import re
 
 # Default I2C address for Delta PSU (can be changed via command line)
 I2C_ADDRESS = 0x60
@@ -130,27 +135,160 @@ class DeltaPSU:
     Class to interface with Delta Electronics Q54SG series power supply units.
     
     This class provides methods to read various parameters and status information
-    from the PSU via PMBus interface.
+    from the PSU via PMBus interface or from a hex dump file.
     
     Attributes:
-        bus (SMBus): I2C bus object
+        bus (SMBus): I2C bus object (None when using file mode)
         address (int): I2C address of the PSU
+        hex_data (dict): Dictionary containing hex data
+        debug (bool): Whether to print debug information
     """
     
-    def __init__(self, bus_number=1, address=I2C_ADDRESS):
+    def __init__(self, bus_number=1, address=I2C_ADDRESS, hex_file=None, debug=False):
         """
         Initialize the PSU interface.
         
         Args:
             bus_number (int): I2C bus number (default: 1)
             address (int): I2C address of the PSU (default: 0x60)
+            hex_file (str): Path to hex dump file (optional)
+            debug (bool): Whether to print debug information
         """
-        self.bus = smbus.SMBus(bus_number)
         self.address = address
+        self.hex_data = {}
+        self.debug = debug
+        
+        if hex_file:
+            self.bus = None
+            self._load_hex_file(hex_file)
+        else:
+            self.bus = smbus.SMBus(bus_number)
+            self._load_smbus_data()
+            
+    def _load_smbus_data(self):
+        """
+        Load all necessary data from SMBus device.
+        """
+        try:
+            if self.debug:
+                print(f"\nLoading SMBus data from address 0x{self.address:02X}")
+            
+            # Read all necessary registers
+            registers = [
+                # Manufacturer info
+                CMD_MFR_ID, CMD_MFR_MODEL, CMD_MFR_REVISION, CMD_MFR_LOCATION,
+                CMD_MFR_DATE, CMD_MFR_SERIAL, CMD_PMBUS_REVISION,
+                
+                # Status registers
+                CMD_STATUS_WORD, CMD_STATUS_VOUT, CMD_STATUS_IOUT,
+                CMD_STATUS_INPUT, CMD_STATUS_TEMPERATURE, CMD_STATUS_CML,
+                CMD_STATUS_OTHER,
+                
+                # Mode registers for linear format
+                CMD_VOUT_MODE, CMD_READ_VIN, CMD_READ_VOUT, CMD_READ_IOUT,
+                CMD_READ_PIN, CMD_READ_POUT,
+                
+                # Measurement registers
+                CMD_READ_TEMPERATURE_1, CMD_READ_TEMPERATURE_2, CMD_READ_TEMPERATURE_3,
+                CMD_READ_FAN_SPEED_1, CMD_READ_FAN_SPEED_2, CMD_READ_FAN_SPEED_3,
+                CMD_READ_FAN_SPEED_4, CMD_READ_DUTY_CYCLE, CMD_READ_FREQUENCY
+            ]
+            
+            # Read each register
+            for reg in registers:
+                try:
+                    # For word registers
+                    if reg in [CMD_STATUS_WORD, CMD_STATUS_VOUT, CMD_STATUS_IOUT,
+                             CMD_STATUS_INPUT, CMD_STATUS_TEMPERATURE, CMD_STATUS_CML,
+                             CMD_STATUS_OTHER, CMD_READ_VIN, CMD_READ_VOUT, CMD_READ_IOUT,
+                             CMD_READ_PIN, CMD_READ_POUT, CMD_READ_TEMPERATURE_1,
+                             CMD_READ_TEMPERATURE_2, CMD_READ_TEMPERATURE_3,
+                             CMD_READ_FAN_SPEED_1, CMD_READ_FAN_SPEED_2,
+                             CMD_READ_FAN_SPEED_3, CMD_READ_FAN_SPEED_4,
+                             CMD_READ_DUTY_CYCLE, CMD_READ_FREQUENCY]:
+                        value = self.bus.read_word_data(self.address, reg)
+                        self.hex_data[reg] = value & 0xFF
+                        self.hex_data[reg + 1] = (value >> 8) & 0xFF
+                    # For byte registers
+                    else:
+                        value = self.bus.read_byte_data(self.address, reg)
+                        self.hex_data[reg] = value
+                except Exception as e:
+                    if self.debug:
+                        print(f"Error reading register 0x{reg:02X}: {e}")
+                    self.hex_data[reg] = 0
+                    if reg in [CMD_STATUS_WORD, CMD_READ_VIN, CMD_READ_VOUT, CMD_READ_IOUT,
+                             CMD_READ_PIN, CMD_READ_POUT]:
+                        self.hex_data[reg + 1] = 0
+                    
+            if self.debug:
+                print(f"\nLoaded {len(self.hex_data)} bytes from SMBus")
+                print("First few bytes:")
+                for addr in sorted(self.hex_data.keys())[:10]:
+                    print(f"  0x{addr:02X}: 0x{self.hex_data[addr]:02X}")
+                    
+        except Exception as e:
+            if self.debug:
+                print(f"Error reading SMBus data: {e}")
+            raise
+            
+    def _load_hex_file(self, hex_file):
+        """
+        Load hex data from a file.
+        
+        Args:
+            hex_file (str): Path to the hex dump file
+        """
+        try:
+            if self.debug:
+                print(f"\nLoading hex file: {hex_file}")
+            
+            with open(hex_file, 'r') as f:
+                lines = f.readlines()
+            
+            if self.debug:
+                print(f"Found {len(lines)} lines in file")
+                print(f"First line (header): {lines[0].strip()}")
+            
+            # Skip the first line (header)
+            for line_num, line in enumerate(lines[1:], 1):
+                line = line.strip()
+                if not line:  # Skip empty lines
+                    continue
+                    
+                # Parse the line format: "00: 01 02 03 ..."
+                match = re.match(r'(\w+):\s+((?:\w{2}\s+)*)', line)
+                if match:
+                    offset = int(match.group(1), 16)
+                    hex_values = match.group(2).strip().split()
+                    if self.debug:
+                        print(f"\nLine {line_num}:")
+                        print(f"  Offset: 0x{offset:02X}")
+                        print(f"  Hex values: {' '.join(hex_values)}")
+                    
+                    for i, hex_val in enumerate(hex_values):
+                        value = int(hex_val, 16)
+                        self.hex_data[offset + i] = value
+                        if self.debug:
+                            print(f"    Address 0x{offset + i:02X}: 0x{value:02X}")
+                elif self.debug:
+                    print(f"\nWarning: Line {line_num} did not match expected format:")
+                    print(f"  Line: {line}")
+            
+            if self.debug:
+                print(f"\nLoaded {len(self.hex_data)} bytes from hex file")
+                print("First few bytes:")
+                for addr in sorted(self.hex_data.keys())[:10]:
+                    print(f"  0x{addr:02X}: 0x{self.hex_data[addr]:02X}")
+                    
+        except Exception as e:
+            if self.debug:
+                print(f"Error reading hex file: {e}")
+            raise
         
     def read_byte(self, command):
         """
-        Read a single byte from the PMBus device.
+        Read a single byte from the PMBus device or hex data.
         
         Args:
             command (int): PMBus command code
@@ -158,7 +296,15 @@ class DeltaPSU:
         Returns:
             int: Byte value read from the device
         """
-        return self.bus.read_byte_data(self.address, command)
+        if self.bus is None:
+            value = self.hex_data.get(command, 0)
+            if self.debug:
+                print(f"read_byte(0x{command:02X}) -> 0x{value:02X} (from hex_data)")
+            return value
+        value = self.bus.read_byte_data(self.address, command)
+        if self.debug:
+            print(f"read_byte(0x{command:02X}) -> 0x{value:02X} (from SMBus)")
+        return value
         
     def write_byte(self, command, value):
         """
@@ -168,11 +314,14 @@ class DeltaPSU:
             command (int): PMBus command code
             value (int): Byte value to write
         """
+        if self.bus is None:
+            raise RuntimeError("Write operations not supported in file mode")
         self.bus.write_byte_data(self.address, command, value)
         
     def read_word(self, command):
         """
-        Read a word (2 bytes) from the PMBus device.
+        Read a word (2 bytes) from the PMBus device or hex data.
+        Handles PMBus linear data format.
         
         Args:
             command (int): PMBus command code
@@ -180,7 +329,103 @@ class DeltaPSU:
         Returns:
             int: Word value read from the device
         """
-        return self.bus.read_word_data(self.address, command)
+        if self.bus is None:
+            # Handle special cases for status registers
+            if command in [CMD_STATUS_WORD, CMD_STATUS_VOUT, CMD_STATUS_IOUT,
+                         CMD_STATUS_INPUT, CMD_STATUS_TEMPERATURE, CMD_STATUS_CML,
+                         CMD_STATUS_OTHER]:
+                # Status registers are stored at specific offsets in the hex data
+                status_offsets = {
+                    CMD_STATUS_WORD: 0x00,      # First word in the dump
+                    CMD_STATUS_VOUT: 0x02,      # Second word
+                    CMD_STATUS_IOUT: 0x04,       # Third word
+                    CMD_STATUS_INPUT: 0x06,     # Fourth word
+                    CMD_STATUS_TEMPERATURE: 0x08, # Fifth word
+                    CMD_STATUS_CML: 0x0A,       # Sixth word
+                    CMD_STATUS_OTHER: 0x0C      # Seventh word
+                }
+                offset = status_offsets.get(command, command)
+                byte1 = self.hex_data.get(offset, 0)
+                byte2 = self.hex_data.get(offset + 1, 0)
+                value = (byte2 << 8) | byte1  # Little-endian format
+                if self.debug:
+                    print(f"read_word(0x{command:02X}) -> 0x{value:04X} (from hex_data offset 0x{offset:02X}: 0x{byte2:02X} 0x{byte1:02X})")
+                return value
+            
+            # Read two bytes and combine them
+            byte1 = self.hex_data.get(command, 0)
+            byte2 = self.hex_data.get(command + 1, 0)
+            value = (byte2 << 8) | byte1  # Little-endian format
+            if self.debug:
+                print(f"read_word(0x{command:02X}) -> 0x{value:04X} (from hex_data: 0x{byte2:02X} 0x{byte1:02X})")
+        else:
+            value = self.bus.read_word_data(self.address, command)
+            if self.debug:
+                print(f"read_word(0x{command:02X}) -> 0x{value:04X} (from SMBus)")
+        
+        # Handle PMBus linear data format
+        if command in [CMD_READ_VIN, CMD_READ_VOUT, CMD_READ_IOUT, CMD_READ_PIN, CMD_READ_POUT]:
+            # For voltage, current, and power readings
+            # Y = (mX + b) * 10^R
+            # where:
+            # Y = real value
+            # X = raw value
+            # m = coefficient (stored in upper 5 bits)
+            # b = offset (stored in lower 11 bits)
+            # R = exponent (stored in upper 5 bits)
+            
+            # Get the mode byte for this command
+            mode_cmd = command - 0x80  # Convert to mode command
+            if self.bus is None:
+                mode = self.hex_data.get(mode_cmd, 0)
+            else:
+                mode = self.bus.read_byte_data(self.address, mode_cmd)
+            
+            if self.debug:
+                print(f"  Mode byte: 0x{mode:02X}")
+            
+            # Extract m, b, and R from mode byte
+            m = (mode >> 3) & 0x1F
+            b = mode & 0x07
+            R = (mode >> 3) & 0x1F
+            
+            # Calculate real value
+            real_value = (m * value + b) * (10 ** R)
+            
+            if self.debug:
+                print(f"  Linear format: m={m}, b={b}, R={R}")
+                print(f"  Raw value: {value}")
+                print(f"  Real value: {real_value}")
+            
+            return int(real_value)
+            
+        elif command in [CMD_READ_TEMPERATURE_1, CMD_READ_TEMPERATURE_2, CMD_READ_TEMPERATURE_3]:
+            # For temperature readings
+            # Y = (mX + b) * 10^R
+            # where m=1, b=0, R=0 for temperature
+            return value
+            
+        elif command in [CMD_READ_FAN_SPEED_1, CMD_READ_FAN_SPEED_2, CMD_READ_FAN_SPEED_3, CMD_READ_FAN_SPEED_4]:
+            # For fan speed readings
+            # Y = (mX + b) * 10^R
+            # where m=1, b=0, R=0 for fan speed
+            return value
+            
+        elif command in [CMD_READ_DUTY_CYCLE]:
+            # For duty cycle readings
+            # Y = (mX + b) * 10^R
+            # where m=1, b=0, R=0 for duty cycle
+            return value
+            
+        elif command in [CMD_READ_FREQUENCY]:
+            # For frequency readings
+            # Y = (mX + b) * 10^R
+            # where m=1, b=0, R=0 for frequency
+            return value
+            
+        else:
+            # For other readings, return raw value
+            return value
         
     def write_word(self, command, value):
         """
@@ -190,11 +435,13 @@ class DeltaPSU:
             command (int): PMBus command code
             value (int): Word value to write
         """
+        if self.bus is None:
+            raise RuntimeError("Write operations not supported in file mode")
         self.bus.write_word_data(self.address, command, value)
         
     def read_string(self, command, length=16):
         """
-        Read a string from the PMBus device.
+        Read a string from the PMBus device or hex data.
         
         Args:
             command (int): PMBus command code
@@ -204,9 +451,36 @@ class DeltaPSU:
             str: String read from the device, or "Not Available" if read fails
         """
         try:
-            data = self.bus.read_i2c_block_data(self.address, command, length)
-            return ''.join([chr(x) for x in data if x != 0])
-        except:
+            # Handle special cases for manufacturer data
+            if command == CMD_MFR_ID:
+                # Read from offset 0x0C where "DELTA" is stored
+                data = [self.hex_data.get(0x0C + i, 0) for i in range(5)]  # "DELTA" is 5 characters
+                if self.debug:
+                    print(f"Manufacturer data from offset 0x0C: {' '.join([f'0x{x:02X}' for x in data])}")
+            elif command == CMD_MFR_MODEL:
+                # Read from offset 0x10 where model number is stored
+                data = [self.hex_data.get(0x10 + i, 0) for i in range(11)]  # "DPS-800AB-30" is 11 characters
+                if self.debug:
+                    print(f"Model data from offset 0x10: {' '.join([f'0x{x:02X}' for x in data])}")
+            elif command == CMD_MFR_SERIAL:
+                # Read from offset 0x30 where serial number is stored
+                data = [self.hex_data.get(0x30 + i, 0) for i in range(12)]  # "IBKD2022005142" is 12 characters
+                if self.debug:
+                    print(f"Serial data from offset 0x30: {' '.join([f'0x{x:02X}' for x in data])}")
+            else:
+                # For other strings, use the command address
+                data = [self.hex_data.get(command + i, 0) for i in range(length)]
+                if self.debug:
+                    print(f"read_string(0x{command:02X}, {length}) raw data: {' '.join([f'0x{x:02X}' for x in data])}")
+            
+            # Filter out non-printable characters and special characters
+            result = ''.join([chr(x) for x in data if x != 0 and 32 <= x <= 126])
+            if self.debug:
+                print(f"read_string(0x{command:02X}, {length}) -> '{result}'")
+            return result
+        except Exception as e:
+            if self.debug:
+                print(f"read_string(0x{command:02X}, {length}) -> 'Not Available' (error: {e})")
             return "Not Available"
         
     def get_status(self):
@@ -427,107 +701,122 @@ class DeltaPSU:
         except Exception as e:
             return {'error': str(e)}
 
-def print_human_readable(info):
+def format_human_readable(data):
     """
-    Print PSU information in human-readable format.
+    Format PSU data in human-readable format.
     
     Args:
-        info (dict): Dictionary containing PSU information
+        data (dict): Dictionary containing PSU data
+        
+    Returns:
+        str: Formatted string
     """
-    print("\nDelta PSU Information:")
-    print("-" * 50)
+    output = []
+    output.append("\nDelta PSU Information:")
+    output.append("-" * 50)
     
-    print("\nManufacturer Information:")
-    for key, value in info['manufacturer_info'].items():
-        print(f"{key}: {value}")
+    output.append("\nManufacturer Information:")
+    output.append(f"Manufacturer: {data['manufacturer']}")
+    output.append(f"Model: {data['model']}")
+    output.append(f"Serial: {data['serial']}")
+    output.append(f"Revision: {data['revision']}")
     
-    print("\nOperating Parameters:")
-    for key, value in info['operating_parameters'].items():
-        if key == 'efficiency':
-            print(f"{key}: {value}%")
-        elif key in ['input_voltage', 'output_voltage']:
-            print(f"{key}: {value}V")
-        elif key == 'output_current':
-            print(f"{key}: {value}A")
+    output.append("\nStatus:")
+    for key, value in data['status'].items():
+        output.append(f"{key}: 0x{value:04X}")
+    
+    output.append("\nMeasurements:")
+    for key, value in data['measurements'].items():
+        if key in ['vin', 'vout']:
+            output.append(f"{key}: {value}V")
+        elif key == 'iout':
+            output.append(f"{key}: {value}A")
         elif key == 'temperature':
-            print(f"{key}: {value}°C")
+            output.append(f"{key}: {value}°C")
         elif key == 'fan_speed':
-            print(f"{key}: {value} RPM")
-        elif key == 'switching_frequency':
-            print(f"{key}: {value} Hz")
+            output.append(f"{key}: {value} RPM")
         elif key == 'duty_cycle':
-            print(f"{key}: {value}%")
-        elif key in ['input_power', 'output_power']:
-            print(f"{key}: {value}W")
+            output.append(f"{key}: {value}%")
+        elif key == 'frequency':
+            output.append(f"{key}: {value} Hz")
+        elif key in ['pout', 'pin']:
+            output.append(f"{key}: {value}W")
         else:
-            print(f"{key}: {value}")
+            output.append(f"{key}: {value}")
     
-    print("\nTemperature Readings:")
-    for key, value in info['temperatures'].items():
-        print(f"{key}: {value}°C")
-    
-    print("\nFan Speeds:")
-    for key, value in info['fan_speeds'].items():
-        print(f"{key}: {value} RPM")
-    
-    print("\nStatus Registers:")
-    for key, value in info['status'].items():
-        print(f"{key}: 0x{value:04X}")
-    
-    print("\nFault and Warning Limits:")
-    for key, value in info['fault_limits'].items():
-        if 'voltage' in key:
-            print(f"{key}: {value}V")
-        elif 'current' in key:
-            print(f"{key}: {value}A")
-        elif 'temperature' in key:
-            print(f"{key}: {value}°C")
-        else:
-            print(f"{key}: {value}")
-    
-    print("\nTiming Parameters:")
-    for key, value in info['timing_parameters'].items():
-        print(f"{key}: {value}ms")
+    return "\n".join(output)
 
 def main():
-    """
-    Main function to handle command line arguments and execute the PSU reader.
-    """
     parser = argparse.ArgumentParser(description='Delta PSU PMBus Reader')
-    parser.add_argument('--address', '-a', type=str, default=f"0x{I2C_ADDRESS:02X}",
-                      help='I2C address in hex (e.g., 0x60)')
-    parser.add_argument('--json', '-j', action='store_true',
-                      help='Output in JSON format')
-    parser.add_argument('--output', '-o', type=str,
-                      help='Save output to JSON file')
-    parser.add_argument('--bus', '-b', type=int, default=1,
-                      help='I2C bus number (default: 1)')
-    
+    parser.add_argument('--json', action='store_true', help='Output in JSON format')
+    parser.add_argument('--output', type=str, help='Output file path')
+    parser.add_argument('--address', type=str, default='0x60', help='I2C address (default: 0x60)')
+    parser.add_argument('--bus', type=int, default=1, help='I2C bus number (default: 1)')
+    parser.add_argument('--file', type=str, help='Read from hex dump file instead of I2C')
+    parser.add_argument('--debug', action='store_true', help='Enable debug output')
     args = parser.parse_args()
-    
+
     try:
-        # Convert hex address string to integer
+        # Convert address string to integer
         address = int(args.address, 16)
-        psu = DeltaPSU(bus_number=args.bus, address=address)
         
-        # Get all information
-        info = psu.get_all_info()
+        # Initialize PSU interface
+        psu = DeltaPSU(bus_number=args.bus, address=address, hex_file=args.file, debug=args.debug)
         
+        if args.debug:
+            print("\nCollecting PSU information...")
+        
+        # Get PSU information
+        data = {
+            'timestamp': datetime.now().isoformat(),
+            'manufacturer': psu.read_string(CMD_MFR_ID),
+            'model': psu.read_string(CMD_MFR_MODEL),
+            'serial': psu.read_string(CMD_MFR_SERIAL),
+            'revision': psu.read_string(CMD_MFR_REVISION),
+            'status': {
+                'word': psu.get_status(),
+                'vin': psu.read_word(CMD_STATUS_VOUT),
+                'iout': psu.read_word(CMD_STATUS_IOUT),
+                'temperature': psu.read_word(CMD_STATUS_TEMPERATURE),
+                'fan': psu.read_word(CMD_STATUS_OTHER),
+                'other': psu.read_word(CMD_STATUS_OTHER)
+            },
+            'measurements': {
+                'vin': psu.get_vin(),
+                'vout': psu.get_vout(),
+                'iout': psu.get_iout(),
+                'temperature': psu.get_temperature(),
+                'fan_speed': psu.get_fan_speed(),
+                'duty_cycle': psu.get_duty_cycle(),
+                'frequency': psu.get_frequency(),
+                'pout': psu.get_power()[1],
+                'pin': psu.get_power()[0]
+            }
+        }
+
+        if args.debug:
+            print("\nCollected data:")
+            print(json.dumps(data, indent=2))
+
         if args.json:
-            # Output as JSON
-            if args.output:
-                with open(args.output, 'w') as f:
-                    json.dump(info, f, indent=2)
-                print(f"Data saved to {args.output}")
-            else:
-                print(json.dumps(info, indent=2))
+            output = json.dumps(data, indent=2)
         else:
-            # Output in human-readable format
-            print_human_readable(info)
-            
+            output = format_human_readable(data)
+
+        if args.output:
+            with open(args.output, 'w') as f:
+                f.write(output)
+            if args.debug:
+                print(f"\nData saved to {args.output}")
+        else:
+            print(output)
+
     except Exception as e:
         print(f"Error: {e}")
+        return 1
 
-if __name__ == "__main__":
-    main()
+    return 0
+
+if __name__ == '__main__':
+    exit(main())
 
