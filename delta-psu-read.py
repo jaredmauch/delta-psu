@@ -306,6 +306,42 @@ class DeltaPSU:
                 print(f"read_word(0x{command:02X}) -> 0x{value:04X} (from offset 0x{offset:02X}: 0x{byte2:02X} 0x{byte1:02X})")
             return value
         
+        # Special handling for VIN - read from offset 0x88 in Linear11 format
+        if command == CMD_READ_VIN:
+            # Read the raw value from offset 0x88
+            byte1 = self.hex_data.get(0x88, 0)
+            byte2 = self.hex_data.get(0x89, 0)
+            raw_value = (byte2 << 8) | byte1  # Little-endian format
+            
+            if self.debug:
+                print(f"VIN raw value from 0x88: 0x{raw_value:04X} (0x{byte2:02X} 0x{byte1:02X})")
+            
+            # Parse Linear11 format
+            # Linear11: Y = (mX + b) * 2^R
+            # where:
+            # Y = real value
+            # X = raw value (11 bits)
+            # m = coefficient (5 bits)
+            # b = offset (11 bits)
+            # R = exponent (5 bits)
+            
+            # Extract components from raw value
+            X = raw_value & 0x7FF  # Lower 11 bits
+            m = (raw_value >> 11) & 0x1F  # Next 5 bits
+            b = (raw_value >> 16) & 0x7FF  # Next 11 bits
+            R = (raw_value >> 27) & 0x1F  # Upper 5 bits
+            
+            if self.debug:
+                print(f"Linear11 components: X={X}, m={m}, b={b}, R={R}")
+            
+            # Calculate real value
+            real_value = (m * X + b) * (2 ** R)
+            
+            if self.debug:
+                print(f"VIN calculated value: {real_value}V")
+            
+            return real_value
+            
         # Read two bytes and combine them
         byte1 = self.hex_data.get(command, 0)
         byte2 = self.hex_data.get(command + 1, 0)
@@ -314,7 +350,7 @@ class DeltaPSU:
             print(f"read_word(0x{command:02X}) -> 0x{value:04X} (0x{byte2:02X} 0x{byte1:02X})")
         
         # Handle PMBus linear data format
-        if command in [CMD_READ_VIN, CMD_READ_VOUT, CMD_READ_IOUT, CMD_READ_PIN, CMD_READ_POUT]:
+        if command in [CMD_READ_VOUT, CMD_READ_IOUT, CMD_READ_PIN, CMD_READ_POUT]:
             # For voltage, current, and power readings
             # Y = (mX + b) * 10^R
             # where:
