@@ -140,7 +140,7 @@ class DeltaPSU:
     Attributes:
         bus (SMBus): I2C bus object (None when using file mode)
         address (int): I2C address of the PSU
-        hex_data (dict): Dictionary containing hex data
+        hex_data (dict): Dictionary containing hex data (256 bytes)
         debug (bool): Whether to print debug information
     """
     
@@ -167,62 +167,22 @@ class DeltaPSU:
             
     def _load_smbus_data(self):
         """
-        Load all necessary data from SMBus device.
+        Load first 256 bytes from SMBus device.
         """
         try:
             if self.debug:
                 print(f"\nLoading SMBus data from address 0x{self.address:02X}")
             
-            # Read all necessary registers
-            registers = [
-                # Manufacturer info
-                CMD_MFR_ID, CMD_MFR_MODEL, CMD_MFR_REVISION, CMD_MFR_LOCATION,
-                CMD_MFR_DATE, CMD_MFR_SERIAL, CMD_PMBUS_REVISION,
-                
-                # Status registers
-                CMD_STATUS_WORD, CMD_STATUS_VOUT, CMD_STATUS_IOUT,
-                CMD_STATUS_INPUT, CMD_STATUS_TEMPERATURE, CMD_STATUS_CML,
-                CMD_STATUS_OTHER,
-                
-                # Mode registers for linear format
-                CMD_VOUT_MODE, CMD_READ_VIN, CMD_READ_VOUT, CMD_READ_IOUT,
-                CMD_READ_PIN, CMD_READ_POUT,
-                
-                # Measurement registers
-                CMD_READ_TEMPERATURE_1, CMD_READ_TEMPERATURE_2, CMD_READ_TEMPERATURE_3,
-                CMD_READ_FAN_SPEED_1, CMD_READ_FAN_SPEED_2, CMD_READ_FAN_SPEED_3,
-                CMD_READ_FAN_SPEED_4, CMD_READ_DUTY_CYCLE, CMD_READ_FREQUENCY
-            ]
-            
-            # Read each register
-            for reg in registers:
+            # Read first 256 bytes
+            for addr in range(256):
                 try:
-                    # For word registers
-                    if reg in [CMD_STATUS_WORD, CMD_STATUS_VOUT, CMD_STATUS_IOUT,
-                             CMD_STATUS_INPUT, CMD_STATUS_TEMPERATURE, CMD_STATUS_CML,
-                             CMD_STATUS_OTHER, CMD_READ_VIN, CMD_READ_VOUT, CMD_READ_IOUT,
-                             CMD_READ_PIN, CMD_READ_POUT, CMD_READ_TEMPERATURE_1,
-                             CMD_READ_TEMPERATURE_2, CMD_READ_TEMPERATURE_3,
-                             CMD_READ_FAN_SPEED_1, CMD_READ_FAN_SPEED_2,
-                             CMD_READ_FAN_SPEED_3, CMD_READ_FAN_SPEED_4,
-                             CMD_READ_DUTY_CYCLE, CMD_READ_FREQUENCY]:
-                        value = self.bus.read_word_data(self.address, reg)
-                        self.hex_data[reg] = value & 0xFF
-                        self.hex_data[reg + 1] = (value >> 8) & 0xFF
-                    # For byte registers
-                    else:
-                        value = self.bus.read_byte_data(self.address, reg)
-                        self.hex_data[reg] = value
-                except Exception as e:
-                    if self.debug:
-                        print(f"Error reading register 0x{reg:02X}: {e}")
-                    self.hex_data[reg] = 0
-                    if reg in [CMD_STATUS_WORD, CMD_READ_VIN, CMD_READ_VOUT, CMD_READ_IOUT,
-                             CMD_READ_PIN, CMD_READ_POUT]:
-                        self.hex_data[reg + 1] = 0
+                    value = self.bus.read_byte_data(self.address, addr)
+                    self.hex_data[addr] = value
+                except:
+                    self.hex_data[addr] = 0
                     
             if self.debug:
-                print(f"\nLoaded {len(self.hex_data)} bytes from SMBus")
+                print(f"Loaded {len(self.hex_data)} bytes from SMBus")
                 print("First few bytes:")
                 for addr in sorted(self.hex_data.keys())[:10]:
                     print(f"  0x{addr:02X}: 0x{self.hex_data[addr]:02X}")
@@ -288,7 +248,7 @@ class DeltaPSU:
         
     def read_byte(self, command):
         """
-        Read a single byte from the PMBus device or hex data.
+        Read a single byte from the cached data.
         
         Args:
             command (int): PMBus command code
@@ -296,14 +256,9 @@ class DeltaPSU:
         Returns:
             int: Byte value read from the device
         """
-        if self.bus is None:
-            value = self.hex_data.get(command, 0)
-            if self.debug:
-                print(f"read_byte(0x{command:02X}) -> 0x{value:02X} (from hex_data)")
-            return value
-        value = self.bus.read_byte_data(self.address, command)
+        value = self.hex_data.get(command, 0)
         if self.debug:
-            print(f"read_byte(0x{command:02X}) -> 0x{value:02X} (from SMBus)")
+            print(f"read_byte(0x{command:02X}) -> 0x{value:02X}")
         return value
         
     def write_byte(self, command, value):
@@ -320,7 +275,7 @@ class DeltaPSU:
         
     def read_word(self, command):
         """
-        Read a word (2 bytes) from the PMBus device or hex data.
+        Read a word (2 bytes) from the cached data.
         Handles PMBus linear data format.
         
         Args:
@@ -329,39 +284,34 @@ class DeltaPSU:
         Returns:
             int: Word value read from the device
         """
-        if self.bus is None:
-            # Handle special cases for status registers
-            if command in [CMD_STATUS_WORD, CMD_STATUS_VOUT, CMD_STATUS_IOUT,
-                         CMD_STATUS_INPUT, CMD_STATUS_TEMPERATURE, CMD_STATUS_CML,
-                         CMD_STATUS_OTHER]:
-                # Status registers are stored at specific offsets in the hex data
-                status_offsets = {
-                    CMD_STATUS_WORD: 0x00,      # First word in the dump
-                    CMD_STATUS_VOUT: 0x02,      # Second word
-                    CMD_STATUS_IOUT: 0x04,       # Third word
-                    CMD_STATUS_INPUT: 0x06,     # Fourth word
-                    CMD_STATUS_TEMPERATURE: 0x08, # Fifth word
-                    CMD_STATUS_CML: 0x0A,       # Sixth word
-                    CMD_STATUS_OTHER: 0x0C      # Seventh word
-                }
-                offset = status_offsets.get(command, command)
-                byte1 = self.hex_data.get(offset, 0)
-                byte2 = self.hex_data.get(offset + 1, 0)
-                value = (byte2 << 8) | byte1  # Little-endian format
-                if self.debug:
-                    print(f"read_word(0x{command:02X}) -> 0x{value:04X} (from hex_data offset 0x{offset:02X}: 0x{byte2:02X} 0x{byte1:02X})")
-                return value
-            
-            # Read two bytes and combine them
-            byte1 = self.hex_data.get(command, 0)
-            byte2 = self.hex_data.get(command + 1, 0)
+        # Handle special cases for status registers
+        if command in [CMD_STATUS_WORD, CMD_STATUS_VOUT, CMD_STATUS_IOUT,
+                     CMD_STATUS_INPUT, CMD_STATUS_TEMPERATURE, CMD_STATUS_CML,
+                     CMD_STATUS_OTHER]:
+            # Status registers are stored at specific offsets in the hex data
+            status_offsets = {
+                CMD_STATUS_WORD: 0x00,      # First word in the dump
+                CMD_STATUS_VOUT: 0x02,      # Second word
+                CMD_STATUS_IOUT: 0x04,       # Third word
+                CMD_STATUS_INPUT: 0x06,     # Fourth word
+                CMD_STATUS_TEMPERATURE: 0x08, # Fifth word
+                CMD_STATUS_CML: 0x0A,       # Sixth word
+                CMD_STATUS_OTHER: 0x0C      # Seventh word
+            }
+            offset = status_offsets.get(command, command)
+            byte1 = self.hex_data.get(offset, 0)
+            byte2 = self.hex_data.get(offset + 1, 0)
             value = (byte2 << 8) | byte1  # Little-endian format
             if self.debug:
-                print(f"read_word(0x{command:02X}) -> 0x{value:04X} (from hex_data: 0x{byte2:02X} 0x{byte1:02X})")
-        else:
-            value = self.bus.read_word_data(self.address, command)
-            if self.debug:
-                print(f"read_word(0x{command:02X}) -> 0x{value:04X} (from SMBus)")
+                print(f"read_word(0x{command:02X}) -> 0x{value:04X} (from offset 0x{offset:02X}: 0x{byte2:02X} 0x{byte1:02X})")
+            return value
+        
+        # Read two bytes and combine them
+        byte1 = self.hex_data.get(command, 0)
+        byte2 = self.hex_data.get(command + 1, 0)
+        value = (byte2 << 8) | byte1  # Little-endian format
+        if self.debug:
+            print(f"read_word(0x{command:02X}) -> 0x{value:04X} (0x{byte2:02X} 0x{byte1:02X})")
         
         # Handle PMBus linear data format
         if command in [CMD_READ_VIN, CMD_READ_VOUT, CMD_READ_IOUT, CMD_READ_PIN, CMD_READ_POUT]:
@@ -376,10 +326,7 @@ class DeltaPSU:
             
             # Get the mode byte for this command
             mode_cmd = command - 0x80  # Convert to mode command
-            if self.bus is None:
-                mode = self.hex_data.get(mode_cmd, 0)
-            else:
-                mode = self.bus.read_byte_data(self.address, mode_cmd)
+            mode = self.hex_data.get(mode_cmd, 0)
             
             if self.debug:
                 print(f"  Mode byte: 0x{mode:02X}")
@@ -441,7 +388,7 @@ class DeltaPSU:
         
     def read_string(self, command, length=16):
         """
-        Read a string from the PMBus device or hex data.
+        Read a string from the cached data.
         
         Args:
             command (int): PMBus command code
